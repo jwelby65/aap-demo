@@ -1,0 +1,213 @@
+"""Native monitoring addon contract tests."""
+
+from __future__ import annotations
+
+import argparse
+import base64
+import json
+import os
+
+import pytest
+
+from aap_demo.addons import get
+from aap_demo.addons.monitoring import NAMESPACE_UID, OWNERSHIP_TOKEN, OWNERSHIP_TOKEN_LABEL
+from aap_demo.cli import observe
+from aap_demo.core.errors import AddonError
+from aap_demo.exec.runner import CompletedCommand
+
+
+def test_monitoring_is_a_native_public_addon() -> None:
+    addon = get("monitoring")
+    assert addon.kind == "native"
+    assert addon.public is True
+    assert addon.needs_cluster is True
+
+
+def test_enable_applies_owned_monitoring_resources_and_saves_password(app_ctx) -> None:
+    addon = get("monitoring")
+    namespace_reads = iter(
+        [
+            CompletedCommand(
+                argv=("kubectl", "get", "namespace", "aap-monitoring"),
+                returncode=1,
+                stderr="NotFound",
+            ),
+            CompletedCommand(
+                argv=("kubectl", "get", "namespace", "aap-monitoring"),
+                returncode=0,
+                stdout=json.dumps({"metadata": {"uid": "monitoring-uid"}}),
+            ),
+        ]
+    )
+    app_ctx.runner.register(
+        ["kubectl", "get", "namespace", "aap-monitoring"], lambda _: next(namespace_reads)
+    )
+    app_ctx.runner.ok(
+        ["kubectl", "get", "secret", "aap-admin-password"],
+        stdout=json.dumps({"data": {"password": base64.b64encode(b"aap-password").decode()}}),
+    )
+    app_ctx.runner.ok(["kubectl", "apply"])
+    app_ctx.runner.ok(["kubectl", "wait"])
+
+    assert addon.enable(app_ctx, argparse.Namespace(addon_args=[])) == 0
+
+    applied = [
+        json.loads(document)
+        for call in app_ctx.runner.calls
+        if call.argv[:2] == ("kubectl", "apply") and call.input
+        for document in call.input.split("---")
+        if document.strip().startswith("{")
+    ]
+    assert any(item.get("metadata", {}).get("name") == "aap-monitoring" for item in applied)
+    assert any(
+        item.get("kind") == "Deployment" and item.get("apiVersion") == "apps/v1" for item in applied
+    )
+    policies = [item for item in applied if item.get("kind") == "NetworkPolicy"]
+    assert policies
+    policy = policies[0]
+    assert (
+        policy["spec"]["ingress"][0]["from"][0]["podSelector"]["matchLabels"][
+            "app.kubernetes.io/name"
+        ]
+        == "prometheus"
+    )
+    assert (
+        policy["spec"]["egress"][0]["to"][0]["podSelector"]["matchLabels"][
+            "app.kubernetes.io/component"
+        ]
+        == "aap-gateway"
+    )
+    assert any(
+        rule["to"][0]["namespaceSelector"]["matchLabels"].get("kubernetes.io/metadata.name")
+        == "openshift-dns"
+        for rule in policy["spec"]["egress"]
+    )
+    provisioning = [
+        item for item in applied if item.get("metadata", {}).get("name") == "grafana-provisioning"
+    ]
+    assert provisioning
+    assert "datasources.yaml" in provisioning[0]["data"]
+    assert "dashboards.yaml" in provisioning[0]["data"]
+    password = app_ctx.paths.addon_dir("monitoring") / "grafana-admin-password"
+    assert password.exists()
+    if os.name != "nt":
+        assert password.stat().st_mode & 0o777 == 0o600
+    assert app_ctx.config.get("addons.enabled") == ["monitoring"]
+
+
+def test_enable_uses_configured_aap_namespace(app_ctx) -> None:
+    app_ctx.config.set("core.namespace", "custom-aap")
+    namespace_reads = iter(
+        [
+            CompletedCommand(
+                argv=("kubectl", "get", "namespace", "aap-monitoring"),
+                returncode=1,
+                stderr="NotFound",
+            ),
+            CompletedCommand(
+                argv=("kubectl", "get", "namespace", "aap-monitoring"),
+                returncode=0,
+                stdout=json.dumps({"metadata": {"uid": "monitoring-uid"}}),
+            ),
+        ]
+    )
+    app_ctx.runner.register(
+        ["kubectl", "get", "namespace", "aap-monitoring"], lambda _: next(namespace_reads)
+    )
+    app_ctx.runner.ok(
+        ["kubectl", "get", "secret", "aap-admin-password"],
+        stdout=json.dumps({"data": {"password": base64.b64encode(b"aap-password").decode()}}),
+    )
+    app_ctx.runner.ok(["kubectl", "apply"])
+    app_ctx.runner.ok(["kubectl", "wait"])
+
+    get("monitoring").enable(app_ctx, argparse.Namespace(addon_args=[]))
+
+    apply_call = next(
+        call for call in app_ctx.runner.calls if call.argv[:2] == ("kubectl", "apply")
+    )
+    assert "aap.custom-aap.svc.cluster.local" in apply_call.input
+
+
+def test_enable_refuses_unowned_namespace_before_writing_state(app_ctx) -> None:
+    app_ctx.runner.ok(
+        ["kubectl", "get", "namespace", "aap-monitoring"],
+        stdout=json.dumps({"metadata": {"labels": {"owner": "someone-else"}}}),
+    )
+
+    with pytest.raises(AddonError, match="unowned namespace"):
+        get("monitoring").enable(app_ctx, argparse.Namespace(addon_args=[]))
+
+    assert not app_ctx.runner.called(["kubectl", "get", "secret", "aap-admin-password"])
+    assert not app_ctx.runner.called(["kubectl", "apply"])
+
+
+def test_disable_deletes_only_owned_namespace(app_ctx) -> None:
+    addon = get("monitoring")
+    app_ctx.config.set("addons.enabled", ["monitoring"])
+    app_ctx.config.save()
+    state_dir = app_ctx.paths.addon_dir("monitoring")
+    state_dir.mkdir(parents=True)
+    (state_dir / OWNERSHIP_TOKEN).write_text("token\n", encoding="utf-8")
+    (state_dir / NAMESPACE_UID).write_text("monitoring-uid\n", encoding="utf-8")
+    app_ctx.runner.ok(
+        ["kubectl", "get", "namespace", "aap-monitoring"],
+        stdout=json.dumps(
+            {
+                "metadata": {
+                    "uid": "monitoring-uid",
+                    "labels": {
+                        "app.kubernetes.io/managed-by": "aap-demo-monitoring",
+                        OWNERSHIP_TOKEN_LABEL: "token",
+                    },
+                }
+            }
+        ),
+    )
+    app_ctx.runner.ok(["kubectl", "delete", "namespace", "aap-monitoring"])
+
+    assert addon.disable(app_ctx, argparse.Namespace()) == 0
+    assert app_ctx.runner.called(["kubectl", "delete", "namespace", "aap-monitoring"])
+    assert app_ctx.config.get("addons.enabled") == []
+
+
+def test_disable_refuses_unowned_namespace(app_ctx) -> None:
+    app_ctx.runner.ok(
+        ["kubectl", "get", "namespace", "aap-monitoring"],
+        stdout=json.dumps({"metadata": {"labels": {"owner": "someone-else"}}}),
+    )
+
+    with pytest.raises(AddonError, match="unowned namespace"):
+        get("monitoring").disable(app_ctx, argparse.Namespace())
+
+    assert not app_ctx.runner.called(["kubectl", "delete", "namespace", "aap-monitoring"])
+
+
+def test_monitoring_rejects_unknown_population_action(app_ctx) -> None:
+    with pytest.raises(AddonError, match="unsupported monitoring action"):
+        get("monitoring").enable(app_ctx, argparse.Namespace(addon_args=["unknown"]))
+
+
+def test_status_command_can_target_monitoring(app_ctx) -> None:
+    app_ctx.runner.ok(
+        ["kubectl", "get", "namespace", "aap-monitoring"],
+        stdout=json.dumps({"metadata": {"name": "aap-monitoring"}}),
+    )
+    app_ctx.runner.ok(
+        ["kubectl", "get", "deployment"],
+        stdout=json.dumps({"status": {"availableReplicas": 1}}),
+    )
+    app_ctx.runner.ok(["kubectl", "get", "route", "grafana"], stdout="grafana.example.test\n")
+
+    assert observe.status(app_ctx, argparse.Namespace(addon="monitoring")) == 0
+    assert "Monitoring status" in app_ctx.console.stdout
+    assert "grafana_route: grafana.example.test" in app_ctx.console.stdout
+    assert "readiness: ready" in app_ctx.console.stdout
+
+
+def test_status_reports_not_ready_when_resources_are_missing(app_ctx) -> None:
+    app_ctx.runner.fail(["kubectl", "get", "namespace", "aap-monitoring"], stderr="NotFound")
+    app_ctx.runner.ok(["kubectl", "get", "route", "grafana"], stdout="")
+
+    assert observe.status(app_ctx, argparse.Namespace(addon="monitoring")) == 1
+    assert "readiness: not-ready" in app_ctx.console.stdout

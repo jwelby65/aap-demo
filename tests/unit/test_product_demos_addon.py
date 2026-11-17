@@ -200,6 +200,7 @@ def test_enable_with_no_name_lists_fleet_and_product_demos() -> None:
         "eda-playground",
         "fleet",
         "mcp-server",
+        "monitoring",
         "ollama",
         "product-demo-satellite",
         "product-demos",
