@@ -253,10 +253,12 @@ if [ "$ACTION" = "--delete" ] || [ "$ACTION" = "delete" ]; then
             elif [ -n "$MATCH_IDS" ]; then
               echo 'OAuth application ownership mismatch; skipping application deletion'
             fi
-          elif [ "$(grep -c . <<<"$MATCH_IDS" || true)" = 1 ]; then
-            APP_ID="$MATCH_IDS"
           elif [ -n "$MATCH_IDS" ]; then
-            cleanup_error 'multiple exact-name OAuth applications found'
+            if [ "$(grep -c . <<<"$MATCH_IDS" || true)" = 1 ]; then
+              echo 'No saved OAuth application ownership state; skipping application deletion'
+            else
+              cleanup_error 'multiple exact-name OAuth applications found'
+            fi
           fi
         fi
       fi
